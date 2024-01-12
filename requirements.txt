@@ -1,0 +1,5 @@
+pandas
+tensor_parallel
+accelerate
+sentencepiece
+protobuf
