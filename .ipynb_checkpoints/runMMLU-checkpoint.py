@@ -2,13 +2,21 @@ import argparse
 import json
 import os
 import time
+import math
+import numpy as np
+import pandas as pd
+import re
 
 import pandas as pd
 import tensor_parallel as tp
 import torch
-from tqdm import tqdm
+from torch.distributions import Categorical
+from tqdm import tqdm, tqdm_notebook
+from scipy.stats import entropy
 from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, AutoModelForCausalLM
-
+from  transformers.generation.logits_process import LogitsProcessorList
+from  transformers.generation.stopping_criteria import StoppingCriteriaList, MaxLengthCriteria
+import transformers
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 TASKS = [
@@ -135,7 +143,7 @@ def load(ckpt_dir, model_type):
         # we use tensor parallel for loading llama
         tokenizer = LlamaTokenizer.from_pretrained(ckpt_dir, use_fast=False, padding_side="left")
         
-        model = LlamaForCausalLM.from_pretrained(ckpt_dir, low_cpu_mem_usage = True, torch_dtype=torch.float16)
+        model = LlamaForCausalLM.from_pretrained(ckpt_dir, attention_dropout=.1, low_cpu_mem_usage = True, torch_dtype=torch.float16)
         model = tp.tensor_parallel(model, [i for i in range(n_gpus)])
 
         tokenizer.pad_token_id = 0 if tokenizer.pad_token_id is None else tokenizer.pad_token_id
@@ -248,11 +256,160 @@ def batch_infer(model, tokenizer, prompts):
     answers = [answer[-1] for answer in answers]
     return answers
 
+def confidence_infer(model, tokenizer, prompts, token_confidence_funcs, confidence_aggregation_funcs, sequence_confidence_funcs):
+    answers = []
+    confidences = []
+    for prompt in tqdm(prompts):
+        answer, confidence_dict = generate_with_confidence(model, tokenizer, prompt, 1, token_confidence_funcs, confidence_aggregation_funcs, sequence_confidence_funcs )
+        
+        answers.extend(answer)
+        confidences.extend(confidence_dict)
+        
+    return answers,confidences
+
+
+
+def min_confidence_agg(values, all_ids, model):
+    return 'min', min(values)
+def max_confidence_agg(values, all_ids, model):
+    return 'max', max(values)
+def avg_confidence_agg(values, all_ids, model):
+    return 'avg', torch.mean(torch.cat(tuple([v.unsqueeze(0) for v in values])),dim = -1)
+def attention_weighted_agg(values, all_ids, model):
+    #based on Guan et. al. 2023 Shifting Attention to Relevance
+    with torch.no_grad():
+        model_inputs = model.prepare_inputs_for_generation(all_ids, )
+        outputs = model(
+            **model_inputs,
+                return_dict=True,
+                output_attentions=True,
+                output_hidden_states=False,
+        )
+    attn_weights = outputs['attentions'][0][-1,-1,-1,-1*len(values):]
+    return 'attention_weighted', torch.dot(torch.cat(tuple([v.unsqueeze(0) for v in values])).half() ,attn_weights)/torch.sum(attn_weights)
+
+def logit_confidence(next_tokens_scores, next_token, all_ids, model):
+    return 'logit', torch.max(next_tokens_scores[-1,-1,:])
+    
+def softmax_confidence(next_tokens_scores, next_token, all_ids, model):
+    return 'softmax' , torch.max(torch.nn.functional.softmax(next_tokens_scores[-1,-1,:], dim = -1))
+    
+def entropy_confidence(next_tokens_scores, next_token, all_ids, model):
+    return 'entropy' , Categorical(probs=torch.nn.functional.softmax(next_tokens_scores[-1,-1,:], dim = -1)).entropy()
+
+def ensemble_entropy_confidence(next_tokens_scores, next_token, all_ids, model, n_ensemble=5):
+    model.train()
+    estimate_vector = torch.zeros(next_tokens_scores.shape[-1], dtype = torch.float32, device = model.device)
+    logits_processor = LogitsProcessorList()
+
+    for i in range(n_ensemble):
+        
+        with torch.no_grad():
+            model_inputs = model.prepare_inputs_for_generation(all_ids, )
+            outputs = model(
+                **model_inputs,
+                    return_dict=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+            )
+        next_tokens_scores = logits_processor(outputs['logits'][:,-1,:], outputs['logits'])
+        next_token = torch.argmax(next_tokens_scores[:,-1,:])
+        estimate_vector[next_token.item()] += 1
+        
+    estimate_vector = estimate_vector/n_ensemble # probabilities should sum to 1
+    model.eval()
+    return 'ensemble_entropy' , Categorical(probs=estimate_vector).entropy() 
+
+def MMLU_self_reflection_confidence_promptv1(n_prompt_tokens,all_ids, model, tokenizer, prompt):
+    proposed_answer = tokenizer.decode(all_ids[-1,-1*(all_ids.shape[-1] - n_prompt_tokens):])
+    prompt = prompt[:-7] # remove the "Answer:" at the end of the prompt
+    prompt = prompt + f'''Proposed Answer: {proposed_answer}
+Is the proposed answer:
+(A) True
+(B) False
+The proposed answer is: '''
+    encode_inputs = prepare_prompt(tokenizer, prompt)
+    outputs = model.generate(**encode_inputs, max_new_tokens=1, pad_token_id=tokenizer.pad_token_id)
+
+    return 'self_reflection_promptv1',1 if outputs[-1,-1].item() == tokenizer.encode('A')[-1] else 0 #return 1 if model outputs 'A' else 0
+
+def prepare_prompt(tokenizer, prompt):
+    input_tokens = tokenizer.encode_plus(prompt, return_tensors="pt", padding=True)
+    input_tokens = {
+            k:input_tokens[k] for k in input_tokens if k in ["input_ids", "attention_mask"]
+    }
+    for t in input_tokens:
+        if torch.is_tensor(input_tokens[t]):
+            input_tokens[t] = input_tokens[t].to('cuda')
+    return input_tokens
+
+
+
+
+def generate_with_confidence(model, tokenizer, prompt, max_new_tokens, token_confidence_funcs, confidence_aggregation_funcs, sequence_confidence_funcs ):
+    all_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device) 
+    n_prompt_tokens = all_ids.shape[-1]
+    logits_processor = LogitsProcessorList()
+    stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=n_prompt_tokens+max_new_tokens)])
+    pad_token_id = model.generation_config.pad_token_id
+    eos_token_id = model.generation_config.eos_token_id
+
+    all_token_confidences = {}
+    sequence_confidences = {}
+
+    while True:
+
+        with torch.no_grad():
+            model_inputs = model.prepare_inputs_for_generation(all_ids, )
+        
+
+            outputs = model(
+                **model_inputs,
+                    return_dict=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+            )
+        
+        next_tokens_scores = logits_processor(outputs['logits'][:,-1,:], outputs['logits'])
+        next_token = torch.argmax(next_tokens_scores[:,-1,:])
+
+        token_confidences = { id: val for id, val in [func(next_tokens_scores, next_token, all_ids, model) for func in token_confidence_funcs]}
+
+        for id, val in token_confidences.items():
+            all_token_confidences[id] = all_token_confidences.get(id,[])
+            all_token_confidences[id].append(val)
+        
+        all_ids = torch.cat([all_ids,next_token.unsqueeze(0).unsqueeze(0)],axis = -1)
+
+        if stopping_criteria(all_ids, next_tokens_scores):
+            break
+
+
+    for func in confidence_aggregation_funcs:
+        for token_confidence_id , values in all_token_confidences.items():
+            agg_id , val = func(values, all_ids, model)
+            sequence_confidences[agg_id+'|'+token_confidence_id] = val
+
+    for func in sequence_confidence_funcs:
+        seq_confidence_id , val = func(n_prompt_tokens,all_ids, model, tokenizer, prompt)
+        sequence_confidences[seq_confidence_id] = val       
+
+    
+    answer = tokenizer.decode(all_ids[-1,-1*max_new_tokens:])
+    return [answer], sequence_confidences
+
 
 def main(ckpt_dir: str, param_size: str, model_type: str):
     
     run_results = {}
-    output_filename = 'run_results_%s_%sb.json' % (model_type, param_size)
+    benchmark = 'MMLU'
+
+    output_filename = 'run_results_%s_%s_%sb.json' % (benchmark, model_type, param_size)
+
+    confidence_aggregation_funcs = [min_confidence_agg,max_confidence_agg,avg_confidence_agg,attention_weighted_agg]
+    token_confidence_funcs = [logit_confidence,softmax_confidence,entropy_confidence, ensemble_entropy_confidence]
+    sequence_confidence_funcs = [MMLU_self_reflection_confidence_promptv1, ]
+
     
     model, tokenizer = load(ckpt_dir, model_type)
     start_time = time.time()
@@ -274,9 +431,9 @@ def main(ckpt_dir: str, param_size: str, model_type: str):
             label = test_df.iloc[i, test_df.shape[1]-1]
             records.append({'prompt':prompt, 'answer':label})
 
-        pred_answers = batch_infer(model, tokenizer, [record['prompt'] for record in records])
+        pred_answers, confidences = confidence_infer(model, tokenizer, [record['prompt'] for record in records],token_confidence_funcs, confidence_aggregation_funcs, sequence_confidence_funcs)
         gold_answers = [record['answer'] for record in records]
-        run_results[task] = {'pred_answers':pred_answers, 'gold_answers':gold_answers}
+        run_results[task] = {'pred_answers':pred_answers, 'gold_answers':gold_answers, 'confidences' :confidences}
     with open(output_filename, 'w') as f:
         json.dump(run_results, f, ensure_ascii=False, indent=2)
     

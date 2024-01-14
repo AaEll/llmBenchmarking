@@ -1,5 +1,12 @@
 pandas
-tensor_parallel
+matplotlib
+language_tool_python
+colorama
+transformers
+scipy
 accelerate
+xgboost
+scikit-learn
+tensor_parallel
 sentencepiece
 protobuf

@@ -238,7 +238,7 @@ def batch_split(prompts, batch_num):
     return batch_prompts
 
 def batch_infer(model, tokenizer, prompts):
-    batch_size = 8
+    batch_size = 1
     answers = []
     for batch_input in tqdm(batch_split(prompts, batch_size)):
         encode_inputs = prepare_input(tokenizer, batch_input)
